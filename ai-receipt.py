@@ -33,7 +33,7 @@ def init_db(db_name="expense_test.db"):
     # 建立游標物件 (cursor)，用來向資料庫傳送並執行 SQL 指令
     cursor = conn.cursor()
     
-    # 執行 SQL 指令：如果 expenses 資料表不存在，就建立這張表
+    # 執行 SQL 語法建立交易資料表 (若已存在則不重複建立)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS expenses (
         id TEXT PRIMARY KEY,
@@ -63,7 +63,7 @@ def init_db(db_name="expense_test.db"):
 def parse_receipt_with_ai(image_path: str, model_name: str = "llama3.2-vision") -> dict:
     # 檢查輸入的圖片檔案路徑是否真實存在於硬碟上
     if not os.path.exists(image_path):
-        # 若找不到檔案，主動拋出 FileNotFoundError 錯誤並停止執行
+        # 若找不到檔案，主動拋出 FileNotFoundError 例外錯誤並停止執行
         raise FileNotFoundError(f"找不到指定的圖片檔案: {image_path}")
 
     # 設計提示詞 (Prompt)，嚴格規範 AI 擷取的欄位與強制回傳純 JSON 格式
@@ -86,7 +86,7 @@ def parse_receipt_with_ai(image_path: str, model_name: str = "llama3.2-vision") 
 
     # 呼叫 Ollama 的 chat 介面，將提示詞與圖片檔案路徑傳入
     response = client.chat(
-        # 指定要運行的模型名稱
+        # 指定模型
         model='qwen3-vl:8b',
         # 組裝對話訊息清單
         messages=[{
@@ -105,7 +105,7 @@ def parse_receipt_with_ai(image_path: str, model_name: str = "llama3.2-vision") 
     # 從回傳物件中取得模型輸出的原始字串內容
     ai_text = response['message']['content'].strip()
 
-    # 清理模型可能多加的 markdown 標記 (例如 ```json 或 ```)
+    # 清除 Markdown JSON 代碼塊開頭標記 (例如 ```json 或 ```)
     if ai_text.startswith("```json"):
         # 去除開頭的 ```json
         ai_text = ai_text[7:]
@@ -118,7 +118,7 @@ def parse_receipt_with_ai(image_path: str, model_name: str = "llama3.2-vision") 
     # .strip()清除頭尾多餘的換行與空白
     ai_text = ai_text.strip()
 
-    # 嘗試將模型產生的文字解析為 Python 字典
+    # 嘗試將模型產生的文字轉換成 Python 字典
     try:
         # 使用 json.loads 將符合規格的 JSON 字串轉成 dict
         parsed_data = json.loads(ai_text)
@@ -137,7 +137,7 @@ def parse_receipt_with_ai(image_path: str, model_name: str = "llama3.2-vision") 
     # 將模型的原始輸出文字一併存回字典，方便後續寫入資料庫核對
     parsed_data["raw_ai_response"] = ai_text
 
-    # 回傳結構化後的明細字典
+    # 回傳結構化整理後的明細字典
     return parsed_data
 
 
@@ -170,7 +170,7 @@ def save_expense_to_db(data: dict, db_name="expense_test.db") -> str:
     # 將欄位變數組裝成元組 (tuple)
     values = (
         record_id,                                           # 紀錄主鍵 ID
-        data.get("transaction_date", "2026-11-05"),          # 交易日期
+        data.get("transaction_date", datetime.now().strftime("%Y-%m-%d")),# 交易日期
         data.get("category", "未分類"),                       # 分類
         data.get("item_name", "未知品項"),                    # 品項名稱
         float(data.get("amount", 0.0)),                      # 金額 (確保轉為浮點數)
@@ -180,7 +180,7 @@ def save_expense_to_db(data: dict, db_name="expense_test.db") -> str:
         now_time                                             # 建立時間
     )
 
-    # 執行 SQL 插入指令並帶入資料值
+    # 執行 SQL 語法寫入資料
     cursor.execute(sql, values)
     
     # 提交資料庫變更
@@ -194,7 +194,7 @@ def save_expense_to_db(data: dict, db_name="expense_test.db") -> str:
 
 
 # -----------------------------------------------------------------
-# 步驟四：查詢並印出目前資料庫內的所有記帳紀錄
+# 步驟四：列印全部記帳紀錄
 # -----------------------------------------------------------------
 
 # 定義讀取並列印記帳紀錄的函式
@@ -211,16 +211,16 @@ def list_all_expenses(db_name="expense_test.db"):
     # 抓取所有符合條件的查詢結果
     rows = cursor.fetchall()
     
-    # 印出表格表頭
+    # 印出表格標題列
     print("\n" + "=" * 80)
     print(f"{'日期':<12} | {'分類':<8} | {'通路':<10} | {'對象':<6} | {'金額':<8} | {'品項名稱'}")
     print("-" * 80)
     
-    # 逐筆遍歷查詢出來的每一列資料
+    # 遍歷每筆查詢紀錄
     for row in rows:
         # 解包各欄位變數 欄位取名 方便後續呼叫
         record_id, t_date, cat, item, amt, person, ch = row
-        # 格式化輸出各欄位數值
+        # 格式化輸出對齊
         print(f"{t_date:<12} | {cat:<8} | {ch:<10} | {person:<6} | {amt:<8.1f} | {item}")
         
     print("=" * 80 + "\n")
@@ -230,40 +230,182 @@ def list_all_expenses(db_name="expense_test.db"):
 
 
 # -----------------------------------------------------------------
-# 程式進入點 (執行測試)
+# 步驟五：資料分析與多條件查詢模組 (查某天、某地點、某對象)
 # -----------------------------------------------------------------
 
-# 判斷是否由終端機直接執行本檔案
+def query_expenses(db_name="expense_test.db", date=None, channel=None, target_person=None):
+    """根據使用者輸入的條件動態查詢交易明細"""
+    # 建立與資料庫的連線
+    conn = sqlite3.connect(db_name)
+    # 建立游標物件
+    cursor = conn.cursor()
+    
+    # 設定基礎 SQL 查詢語法，使用 1=1 方便後續動態拼接 AND 條件
+    query = "SELECT transaction_date, category, channel, target_person, amount, item_name FROM expenses WHERE 1=1"
+    # 建立存放查詢參數值的清單
+    params = []
+
+    # 若有指定查詢日期，拼接精確比對條件
+    if date:
+        query += " AND transaction_date = ?"
+        params.append(date)
+    # 若有指定通路或地點，拼接模糊比對條件 (LIKE)
+    if channel:
+        query += " AND channel LIKE ?"
+        params.append(f"%{channel}%")
+    # 若有指定對象，拼接精確比對條件
+    if target_person:
+        query += " AND target_person = ?"
+        params.append(target_person)
+        
+    # 將查詢結果按照交易日期由新到舊排序
+    query += " ORDER BY transaction_date DESC"
+    
+    # 執行帶有參數的 SQL 查詢
+    cursor.execute(query, params)
+    
+    # 取得所有篩選後的資料
+    rows = cursor.fetchall()
+    
+    # 印出查詢結果表頭
+    print("\n" + "=" * 80)
+    print(f"{'日期':<12} | {'分類':<8} | {'通路':<12} | {'對象':<6} | {'金額':<8} | {'品項名稱'}")
+    print("-" * 80)
+    
+    # 初始化篩選金額加總變數
+    total = 0.0
+    
+    # 逐筆遍歷並解包資料
+    for row in rows:
+        t_date, cat, ch, person, amt, item = row
+        # 累加實付金額
+        total += amt
+        # 輸出對齊格式字串
+        print(f"{t_date:<12} | {cat:<8} | {ch:<12} | {person:<6} | {amt:<8.1f} | {item}")
+        
+    print("-" * 80)
+    # 印出筆數統計與加總金額
+    print(f"查詢結果共 {len(rows)} 筆，總支出金額：{total:.1f} 元")
+    print("=" * 80 + "\n")
+    
+    # 關閉連線
+    conn.close()
+
+
+# -----------------------------------------------------------------
+# 步驟六：維度聚合統計模組 (依地點或對象分組加總)
+# -----------------------------------------------------------------
+
+# 定義維度統計函式，支援依據 'channel' 或 'target_person' 分組
+def show_summary_by_dimension(db_name="expense_test.db", dimension="channel"):
+    # 安全驗證：限制分組維度欄位，避免外部任意字串造成安全隱患
+    if dimension not in ["channel", "target_person", "category"]:
+        return
+        
+    # 建立連線
+    conn = sqlite3.connect(db_name)
+    
+    # 建立游標物件
+    cursor = conn.cursor()
+    
+    # 定義欄位對應的中文標題字典
+    label_map = {"channel": "通路/地點", "target_person": "消費對象", "category": "消費類別"}
+    
+    # 執行 SQL GROUP BY 分組聚合查詢：計算各組筆數與金額加總
+    sql = f"""
+    SELECT {dimension}, COUNT(*), SUM(amount)
+    FROM expenses
+    GROUP BY {dimension}
+    ORDER BY SUM(amount) DESC
+    """
+    cursor.execute(sql)
+    
+    # 取得聚合統計資料
+    rows = cursor.fetchall()
+    
+    # 印出統計報表表頭
+    print("\n" + "=" * 45)
+    print(f"{label_map[dimension]:<15} | {'筆數':<6} | {'總花費金額'}")
+    print("-" * 45)
+    
+    # 逐行列印分組結果
+    for name, count, total in rows:
+        display_name = name if name else "未標記"
+        print(f"{display_name:<15} | {count:<6} | {total:<10.1f}")
+        
+    print("=" * 45 + "\n")
+    
+    # 關閉連線
+    conn.close()
+
+
+# -----------------------------------------------------------------
+# 步驟七：終端機互動式主選單
+# -----------------------------------------------------------------
+
+# 定義命令列互動選單函式
+def interactive_menu(db_name="expense_test.db"):
+    # 使用無窮迴圈讓使用者可以連續操作多個功能
+    while True:
+        # 印出功能選項清單
+        print("====== 智慧記帳分析選單 ======")
+        print("1. 查看全部記帳紀錄")
+        print("2. 查詢特定日期的花費 (如 2026-11-04)")
+        print("3. 查詢特定地點/通路的消費 (如 沃爾瑪、全家)")
+        print("4. 查詢特定對象的消費 (如 自己、媽媽)")
+        print("5. 依通路/地點統計總支出")
+        print("6. 依對象統計總支出")
+        print("0. 離開系統")
+        
+        # 接收使用者輸入的代號
+        choice = input("請選擇功能代號 (0-6): ").strip()
+        
+        # 依代號執行對應動作
+        if choice == "1":
+            list_all_expenses(db_name)
+        elif choice == "2":
+            d = input("請輸入日期 (YYYY-MM-DD): ").strip()
+            query_expenses(db_name, date=d)
+        elif choice == "3":
+            c = input("請輸入通路或店名關鍵字: ").strip()
+            query_expenses(db_name, channel=c)
+        elif choice == "4":
+            p = input("請輸入消費對象 (如 自己 / 媽媽): ").strip()
+            query_expenses(db_name, target_person=p)
+        elif choice == "5":
+            show_summary_by_dimension(db_name, dimension="channel")
+        elif choice == "6":
+            show_summary_by_dimension(db_name, dimension="target_person")
+        elif choice == "0":
+            # 退出系統並跳出迴圈
+            print("退出系統。")
+            break
+        else:
+            # 處理無效輸入
+            print("輸入錯誤，請重新選擇！\n")
+
+
+# -----------------------------------------------------------------
+# 程式進入點
+# -----------------------------------------------------------------
+
+# 判斷是否為直接執行此腳本
 if __name__ == "__main__":
-    # 步驟 1：建立或檢查本地資料庫與資料表
+    # 初始化或檢查資料庫結構
     init_db()
 
-    # 設定用來測試的圖片檔案路徑
-    test_image_file = "test_receipt.jpg"
+    # 取得本程式所在資料夾的絕對路徑，拼接測試圖片完整路徑
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    test_image_file = os.path.join(current_dir, "test_receipt.jpg")
 
-    # 檢查測試圖片是否存在，若存在則執行 AI 辨識流程
-    if os.path.exists(test_image_file):
-        # 步驟 2：呼叫本地 AI 模型辨識圖片
+    # 詢問使用者是否要辨識新圖片
+    run_ocr = input("是否要辨識新收據圖片？(y/n，預設 n): ").strip().lower()
+    
+    # 若使用者選擇 y 且圖片確實存在，執行 AI 辨識並存入資料庫
+    if run_ocr == 'y' and os.path.exists(test_image_file):
         result_dict = parse_receipt_with_ai(test_image_file)
-        
-        # 步驟 3：將辨識出來的結構化資料寫入 SQLite
         new_id = save_expense_to_db(result_dict)
         print(f"成功存入資料庫！資料 ID 為: {new_id}")
-    else:
-        # 若還沒放圖片，提供提示並改用一組模擬資料寫入，確保能驗證資料庫功能
-        print(f"提示：在程式同目錄下找不到 '{test_image_file}'，改以一組模擬資料寫入資料庫測試。")
-        mock_data = {
-            "transaction_date": "2026-11-05",
-            "category": "餐飲",
-            "item_name": "無糖黑豆漿、燕麥麵包",
-            "amount": 75.0,
-            "target_person": "自己",
-            "channel": "全家便利商店",
-            "raw_ai_response": '{"mock": true}'
-        }
-        # 寫入模擬資料
-        new_id = save_expense_to_db(mock_data)
-        print(f"模擬資料已成功寫入資料庫！ID 為: {new_id}")
 
-    # 步驟 4：查看目前資料庫內的記帳明細列表
-    list_all_expenses()
+    # 啟動命令列互動選單供使用者查詢與分析
+    interactive_menu()
