@@ -16,6 +16,9 @@ import os
 # ollama 官方函式庫，呼叫本機執行的視覺多模態模型
 import ollama
 
+import sqlite3
+import re
+
 #從 ollama 模組中匯入 Client（客戶端）類別
 from ollama import Client
 
@@ -340,6 +343,112 @@ def show_summary_by_dimension(db_name="expense_test.db", dimension="channel"):
 
 
 # -----------------------------------------------------------------
+# 步驟 A：利用 AI 將大白話轉換為 SQL 查詢語句 (Text-to-SQL)
+# -----------------------------------------------------------------
+def generate_sql_from_natural_language(user_query: str, model_name: str = "qwen3-vl:8b") -> str:
+    """
+    將使用者的日常口語問題轉換成合法的 SQLite SELECT 語法
+    """
+    # 提供資料表結構與規則，讓模型知道如何精準組裝 SQL
+    schema_prompt = f"""
+    你是一個專門將繁體中文自然語言轉換為 SQLite 語句的專家。
+    目前資料庫中有一張名為 expenses 的資料表，欄位如下：
+    - id (TEXT, 主鍵)
+    - transaction_date (TEXT, 日期格式為 'YYYY-MM-DD')
+    - category (TEXT, 消費類別，如：餐飲、日用品、食品、網購)
+    - item_name (TEXT, 商品品項名稱)
+    - amount (REAL, 實付金額)
+    - target_person (TEXT, 消費對象，如：'自己'、'媽媽')
+    - channel (TEXT, 通路/地點，如：'全聯'、'沃爾瑪'、'全家便利商店')
+
+    【嚴格規則】：
+    1. 僅允許生成 SELECT 查詢語句，絕對不可生成 INSERT、UPDATE、DELETE、DROP 等會修改資料的指令。
+    2. 對於地點 (channel) 或品項 (item_name) 等文字比對，請優先使用 LIKE '%關鍵字%' 進行模糊搜尋。
+    3. 務必僅輸出 SQL 語句本體，絕對不要加上任何 Markdown 格式代碼區塊 (如 ```sql)、解釋或多餘標記。
+
+    使用者問題：{user_query}
+    生成的 SQL 語法：
+    """
+
+    # 呼叫你現有的 Ollama Client
+    response = client.chat(
+        model=model_name,
+        messages=[{"role": "user", "content": schema_prompt}],
+        options={"temperature": 0.1} # 調低隨機性，確保 SQL 語法精準
+    )
+    
+    # 取得原始字串並清理前後空白
+    sql_text = response['message']['content'].strip()
+    
+    # 清理模型可能多加的 markdown 語法 (例如 ```sql ... ```)
+    sql_text = re.sub(r"^```(?:sql)?\s*", "", sql_text, flags=re.IGNORECASE)
+    sql_text = re.sub(r"\s*```$", "", sql_text)
+    sql_text = sql_text.strip()
+    
+    return sql_text
+
+
+# -----------------------------------------------------------------
+# 步驟 B：驗證安全性並執行 AI 生成的 SQL
+# -----------------------------------------------------------------
+def ai_natural_language_search(user_query: str, db_name="expense_test.db"):
+    """
+    主流程：取得 AI 生成的 SQL，執行查詢並印出對齊報表
+    """
+    print(f"\n[AI 思考中] 正在分析語意：'{user_query}' ...")
+    
+    # 步驟 1：呼叫 AI 產生 SQL
+    sql = generate_sql_from_natural_language(user_query)
+    print(f"[AI 生成的 SQL] {sql}")
+    
+    # 步驟 2：安全檢查（白名單防禦）
+    # 嚴格限制只能執行 SELECT，防止 SQL 注入或模型失控刪庫
+    cleaned_sql = sql.upper().strip()
+    if not cleaned_sql.startswith("SELECT"):
+        print("【安全攔截】AI 生成了非查詢類的指令，系統已拒絕執行！")
+        return
+
+    forbidden_keywords = ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE"]
+    if any(keyword in cleaned_sql for keyword in forbidden_keywords):
+        print("【安全攔截】SQL 指令包含高風險危險操作關鍵字，已終止執行！")
+        return
+
+    # 步驟 3：連線資料庫執行查詢
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+        
+        # 取得本次查詢回傳的所有欄位名稱
+        columns = [desc[0] for desc in cursor.description]
+        
+        if not rows:
+            print("查無符合條件的消費紀錄。\n")
+            return
+            
+        print("\n" + "=" * 80)
+        # 動態印出欄位名稱表頭
+        header = " | ".join([f"{col:<12}" for col in columns])
+        print(header)
+        print("-" * 80)
+        
+        # 印出查詢出來的每一筆紀錄
+        for row in rows:
+            row_str = " | ".join([f"{str(val):<12}" for val in row])
+            print(row_str)
+            
+        print("=" * 80)
+        print(f"共找到 {len(rows)} 筆資料。\n")
+        
+    except sqlite3.OperationalError as e:
+        print(f"SQL 語法執行錯誤：{e}")
+    finally:
+        conn.close()
+
+
+# -----------------------------------------------------------------
 # 步驟七：終端機互動式主選單
 # -----------------------------------------------------------------
 
@@ -351,14 +460,15 @@ def interactive_menu(db_name="expense_test.db"):
         print("====== 智慧記帳分析選單 ======")
         print("1. 查看全部記帳紀錄")
         print("2. 查詢特定日期的花費 (如 2026-11-04)")
-        print("3. 查詢特定地點/通路的消費 (如 沃爾瑪、全家)")
+        print("3. 查詢特定地點/通路的消費 (如 一般門市、全家便利商店)")
         print("4. 查詢特定對象的消費 (如 自己、媽媽)")
         print("5. 依通路/地點統計總支出")
         print("6. 依對象統計總支出")
+        print("7. 手動輸入文字由ai查詢")
         print("0. 離開系統")
         
         # 接收使用者輸入的代號
-        choice = input("請選擇功能代號 (0-6): ").strip()
+        choice = input("請選擇功能代號 (0-7): ").strip()
         
         # 依代號執行對應動作
         if choice == "1":
@@ -376,6 +486,9 @@ def interactive_menu(db_name="expense_test.db"):
             show_summary_by_dimension(db_name, dimension="channel")
         elif choice == "6":
             show_summary_by_dimension(db_name, dimension="target_person")
+        elif choice == "7":
+            q = input("請輸入你想查的內容: ").strip()
+            ai_natural_language_search(q, db_name)
         elif choice == "0":
             # 退出系統並跳出迴圈
             print("退出系統。")
