@@ -16,11 +16,13 @@ import os
 # ollama 官方函式庫，呼叫本機執行的視覺多模態模型
 import ollama
 
-import sqlite3
 import re
 
 #從 ollama 模組中匯入 Client（客戶端）類別
 from ollama import Client
+
+# 引入 SpeechRecognition 模組，用於麥克風收音與語音轉文字
+import speech_recognition as sr
 
 client = Client(host='http://172.17.24.130:11434')
 
@@ -341,79 +343,148 @@ def show_summary_by_dimension(db_name="expense_test.db", dimension="channel"):
     # 關閉連線
     conn.close()
 
+# -----------------------------------------------------------------
+# 口說搜尋_功能 1：麥克風收音轉文字 (Speech-to-Text)
+# -----------------------------------------------------------------
+def record_voice_to_text() -> str:
+    """
+    透過麥克風收音，並利用 Google 繁體中文語音辨識 API 轉換成字串
+    """
+    recognizer = sr.Recognizer()
+    
+    # 啟用本機預設麥克風
+    with sr.Microphone() as source:
+        print("\n[語音收音] 請開始說話（例如：『查一下昨天買了什麼』或『上禮拜四媽媽花了多少錢』）...")
+        
+        # 動態調整環境噪音基準
+        recognizer.adjust_for_ambient_noise(source, duration=0.8)
+        
+        try:
+            # 開始錄音，限制最長傾聽等待時間為 5 秒，說話長度最長 10 秒
+            audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
+            print("[語音收音] 錄音結束，正在辨識語音內容...")
+            
+            # 使用 Google 語音辨識轉換為繁體中文
+            text = recognizer.recognize_google(audio, language="zh-TW")
+            print(f"[語音辨識結果] 「{text}」")
+            return text
+            
+        except sr.WaitTimeoutError:
+            print("[語音提示] 超過等待時間，未偵測到聲音。")
+            return ""
+        except sr.UnknownValueError:
+            print("[語音提示] 無法清楚辨識語音內容，請再試一次。")
+            return ""
+        except sr.RequestError as e:
+            print(f"[語音錯誤] 語音辨識服務請求失敗: {e}")
+            return ""
+
 
 # -----------------------------------------------------------------
-# 步驟 A：利用 AI 將大白話轉換為 SQL 查詢語句 (Text-to-SQL)
+# 結合「今日日期基準」的 Text-to-SQL 生成
 # -----------------------------------------------------------------
-def generate_sql_from_natural_language(user_query: str, model_name: str = "qwen3-vl:8b") -> str:
-    """
-    將使用者的日常口語問題轉換成合法的 SQLite SELECT 語法
-    """
-    # 提供資料表結構與規則，讓模型知道如何精準組裝 SQL
-    schema_prompt = f"""
-    你是一個專門將繁體中文自然語言轉換為 SQLite 語句的專家。
-    目前資料庫中有一張名為 expenses 的資料表，欄位如下：
-    - id (TEXT, 主鍵)
-    - transaction_date (TEXT, 日期格式為 'YYYY-MM-DD')
-    - category (TEXT, 消費類別，如：餐飲、日用品、食品、網購)
-    - item_name (TEXT, 商品品項名稱)
-    - amount (REAL, 實付金額)
-    - target_person (TEXT, 消費對象，如：'自己'、'媽媽')
-    - channel (TEXT, 通路/地點，如：'全聯'、'沃爾瑪'、'全家便利商店')
+def generate_sql_with_date_context(user_query: str, model_name: str = "qwen3.5:27b") -> str:
+    # 取得系統當前日期與星期
+    weekdays_zh = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    weekday_str = weekdays_zh[now.weekday()]
 
-    【嚴格規則】：
-    1. 僅允許生成 SELECT 查詢語句，絕對不可生成 INSERT、UPDATE、DELETE、DROP 等會修改資料的指令。
-    2. 對於地點 (channel) 或品項 (item_name) 等文字比對，請優先使用 LIKE '%關鍵字%' 進行模糊搜尋。
-    3. 務必僅輸出 SQL 語句本體，絕對不要加上任何 Markdown 格式代碼區塊 (如 ```sql)、解釋或多餘標記。
+    # 在 Prompt 中提供絕對時間錨點 (Anchor)
+    prompt = f"""
+    你是一個精通 SQLite 與時間邏輯推理的資料分析師。
+    你請嚴格依照以下【三步驟】思考，**每個步驟只准執行一次，絕對禁止重複驗算或自我懷疑**：
+    【時間基準】：今天是 {today_str} ({weekday_str})。
+    【資料庫結構】：
+    資料表：expenses
+    欄位：
+    - id (TEXT)
+    - transaction_date (TEXT, 格式固定為 'YYYY-MM-DD')
+    - category (TEXT, 如：餐飲、日用品、食品、網購)
+    - item_name (TEXT, 商品名稱)
+    - amount (REAL, 金額)
+    - target_person (TEXT, 對象：'自己'、'媽媽')
+    - channel (TEXT, 通路/地點：'全聯'、'沃爾瑪'、'全家便利商店')
+
+    【思考步驟（單向執行，做完即結束）】：
+    步驟 1：計算目標日期或區間（例如上個月用 LIKE '2026-10-%'，上禮拜五算成 YYYY-MM-DD）。算出來後直接進入步驟 2，不准重算。
+    步驟 2：決定 SELECT 欄位與 WHERE 條件（文字比對用 LIKE '%關鍵字%'）。
+    步驟 3：立刻停止思考，直接輸出最終 SELECT 語句，不要任何標記或說明。
 
     使用者問題：{user_query}
     生成的 SQL 語法：
     """
 
-    # 呼叫你現有的 Ollama Client
     response = client.chat(
         model=model_name,
-        messages=[{"role": "user", "content": schema_prompt}],
-        options={"temperature": 0.1} # 調低隨機性，確保 SQL 語法精準
+        messages=[{"role": "user", "content": prompt}],
+        options={
+            "temperature": 0.1,    # 保留微幅彈性讓推理更順暢
+            "num_predict": 2048,   # 給足 2048 tokens，讓模型先完成 thinking 再輸出 content
+            "repeat_penalty": 1.15,   # 抑制模型在思考中反覆鬼打牆
+            "num_ctx": 8192
+        }
     )
     
-    # 取得原始字串並清理前後空白
-    sql_text = response['message']['content'].strip()
+    # 從回傳字典中安全取得模型的內部思考過程 ('thinking' 欄位)；若模型沒有回傳此欄位，則預設為空字串 ""
+    thinking_process = response['message'].get('thinking', '')
     
-    # 清理模型可能多加的 markdown 語法 (例如 ```sql ... ```)
+    # 從回傳字典中安全取得模型的正式回答字串 ('content' 欄位)；若沒有則預設為空字串 ""
+    raw_response = response['message'].get('content', '')
+    
+    # 判斷思考過程是否有內容；若有，印出來讓開發者確認 AI 推算日曆與條件的邏輯是否正確
+    if thinking_process:
+        print(f"\n======== [DEBUG] AI 思考推導過程 ========\n{thinking_process}\n=========================================\n")
+        
+    # 使用 repr() 印出正式回覆的原始字串；repr() 會把換行符號(\n)或空格原形畢露，方便排查是否為空字串 ''
+    print(f"======== [DEBUG] AI 正式回覆內容 ========\n{repr(raw_response)}\n=========================================\n")
+
+    # 對原始回答呼叫 .strip()：移除字串「最開頭」與「最結尾」的所有空白字元、換行符號(\n)與定位字元(\t)
+    sql_text = raw_response.strip()
+
+    # 若清理完後發現根本是空字串，直接回傳 "" 交給後續的安全機制攔截，避免多餘的正規表達式運算
+    if not sql_text:
+        return ""
+
+    # 使用正規表達式清理開頭的 Markdown 程式碼區塊標記 (例如 ```sql 或 ```SQL 或 ```)
+    # ^ 代表字串開頭；(?:sql)? 代表可有可無的 sql 字樣；\s* 代表後面的換行或空格；flags=re.IGNORECASE 代表不分大小寫
     sql_text = re.sub(r"^```(?:sql)?\s*", "", sql_text, flags=re.IGNORECASE)
+    
+    # 清理結尾的 Markdown 程式碼區塊標記 (```)
+    # \s* 代表前面的換行或空格；$ 代表字串結尾
     sql_text = re.sub(r"\s*```$", "", sql_text)
-    sql_text = sql_text.strip()
+
+    # 進階保險擷取：用正規表達式尋找以 SELECT 開頭、直到整段結束（或分號結尾）的 SQL 語句
+    # 作用是防止模型在 SQL 前面多講一句「好的，這是一段查詢語法：」導致後面程式判斷開頭不是 SELECT
+    match = re.search(r"(SELECT[\s\S]+)", sql_text, re.IGNORECASE)
     
-    return sql_text
+    # 如果有成功在回答中找到 SELECT 語句
+    if match:
+        # match.group(1) 取出括號內配對到的完整 SQL 語句，並再次用 .strip() 確保頭尾沒有殘留的空白或換行
+        return match.group(1).strip()
+
+    # 若沒配對到標準 SELECT 開頭，仍將清理過頭尾空白的字串回傳，交由外層的安全檢查機制處理
+    return sql_text.strip()
 
 
 # -----------------------------------------------------------------
-# 步驟 B：驗證安全性並執行 AI 生成的 SQL
+# 執行查詢並呈現
 # -----------------------------------------------------------------
-def ai_natural_language_search(user_query: str, db_name="expense_test.db"):
-    """
-    主流程：取得 AI 生成的 SQL，執行查詢並印出對齊報表
-    """
-    print(f"\n[AI 思考中] 正在分析語意：'{user_query}' ...")
-    
-    # 步驟 1：呼叫 AI 產生 SQL
-    sql = generate_sql_from_natural_language(user_query)
-    print(f"[AI 生成的 SQL] {sql}")
-    
-    # 步驟 2：安全檢查（白名單防禦）
-    # 嚴格限制只能執行 SELECT，防止 SQL 注入或模型失控刪庫
-    cleaned_sql = sql.upper().strip()
-    if not cleaned_sql.startswith("SELECT"):
-        print("【安全攔截】AI 生成了非查詢類的指令，系統已拒絕執行！")
+def execute_natural_query(user_query: str, db_name="expense_test.db"):
+    """執行大白話/語音辨識出的自然語言查詢"""
+    if not user_query:
         return
 
-    forbidden_keywords = ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE"]
-    if any(keyword in cleaned_sql for keyword in forbidden_keywords):
-        print("【安全攔截】SQL 指令包含高風險危險操作關鍵字，已終止執行！")
+    print(f"\n[AI 理解中] 正在分析問題：'{user_query}' ...")
+    sql = generate_sql_with_date_context(user_query)
+    print(f"[推算生成的 SQL] {sql}")
+    
+    # 安全檢查
+    upper_sql = sql.upper().strip()
+    if not upper_sql.startswith("SELECT") or any(kw in upper_sql for kw in ["DROP", "DELETE", "UPDATE", "INSERT"]):
+        print("【安全警報】非安全的查詢語法，拒絕執行！")
         return
 
-    # 步驟 3：連線資料庫執行查詢
     conn = sqlite3.connect(db_name)
     cursor = conn.cursor()
     
@@ -421,32 +492,25 @@ def ai_natural_language_search(user_query: str, db_name="expense_test.db"):
         cursor.execute(sql)
         rows = cursor.fetchall()
         
-        # 取得本次查詢回傳的所有欄位名稱
-        columns = [desc[0] for desc in cursor.description]
-        
         if not rows:
             print("查無符合條件的消費紀錄。\n")
             return
             
+        columns = [desc[0] for desc in cursor.description]
         print("\n" + "=" * 80)
-        # 動態印出欄位名稱表頭
-        header = " | ".join([f"{col:<12}" for col in columns])
-        print(header)
+        print(" | ".join([f"{col:<12}" for col in columns]))#標頭
         print("-" * 80)
         
-        # 印出查詢出來的每一筆紀錄
         for row in rows:
-            row_str = " | ".join([f"{str(val):<12}" for val in row])
-            print(row_str)
+            print(" | ".join([f"{str(val):<12}" for val in row]))#查詢出的條目
             
         print("=" * 80)
-        print(f"共找到 {len(rows)} 筆資料。\n")
+        print(f"共查詢到 {len(rows)} 筆資料。\n")
         
     except sqlite3.OperationalError as e:
-        print(f"SQL 語法執行錯誤：{e}")
+        print(f"SQL 執行失敗: {e}")
     finally:
         conn.close()
-
 
 # -----------------------------------------------------------------
 # 步驟七：終端機互動式主選單
@@ -465,10 +529,11 @@ def interactive_menu(db_name="expense_test.db"):
         print("5. 依通路/地點統計總支出")
         print("6. 依對象統計總支出")
         print("7. 手動輸入文字由ai查詢")
+        print("8. 麥克風語音搜尋")
         print("0. 離開系統")
         
         # 接收使用者輸入的代號
-        choice = input("請選擇功能代號 (0-7): ").strip()
+        choice = input("請選擇功能代號 (0-8): ").strip()
         
         # 依代號執行對應動作
         if choice == "1":
@@ -487,8 +552,12 @@ def interactive_menu(db_name="expense_test.db"):
         elif choice == "6":
             show_summary_by_dimension(db_name, dimension="target_person")
         elif choice == "7":
-            q = input("請輸入你想查的內容: ").strip()
-            ai_natural_language_search(q, db_name)
+            q = input("請輸入查詢內容: ").strip()
+            execute_natural_query(q, db_name)
+        elif choice == "8":
+            spoken_text = record_voice_to_text()
+            if spoken_text:
+                execute_natural_query(spoken_text, db_name)
         elif choice == "0":
             # 退出系統並跳出迴圈
             print("退出系統。")
