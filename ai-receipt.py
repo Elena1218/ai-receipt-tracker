@@ -383,7 +383,7 @@ def record_voice_to_text() -> str:
 # -----------------------------------------------------------------
 # 結合「今日日期基準」的 Text-to-SQL 生成
 # -----------------------------------------------------------------
-def generate_sql_with_date_context(user_query: str, model_name: str = "qwen3.5:27b") -> str:
+def generate_sql_with_date_context(user_query: str, model_name: str = "gpt-oss:latest") -> str:
     # 取得系統當前日期與星期
     weekdays_zh = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
     now = datetime.now()
